@@ -1,0 +1,19 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import mongoose from 'mongoose';
+import { Case, GameSession } from './models.js';
+import { generateCase } from './generate.js';
+const app=express();app.use(cors({origin:process.env.CLIENT_ORIGIN||'http://localhost:5173'}));app.use(express.json({limit:'30kb'}));app.use('/api',rateLimit({windowMs:60_000,limit:30,standardHeaders:true,legacyHeaders:false}));
+const memorySessions=new Map();
+const schema=z.object({scenario:z.string().trim().min(20).max(1000),category:z.string().default('Theft'),difficulty:z.enum(['Easy','Medium','Hard']).default('Medium'),suspectCount:z.number().int().min(3).max(6).default(4),setting:z.string().max(120).optional()});const publicCase=d=>{const c=d.toObject?d.toObject():{...d};delete c.solution;return c;};
+async function owned(req,res,next){try{const token=req.header('x-session-token');if(mongoose.connection.readyState===1)req.game=await GameSession.findOne({token}).populate('caseId');if(!req.game)req.game=memorySessions.get(token);if(!req.game)return res.status(401).json({error:'Investigation session not found.'});next();}catch{res.status(500).json({error:'Unable to load investigation.'});}}
+app.get('/api/health',(_q,r)=>r.json({ok:true,database:mongoose.connection.readyState===1?'connected':'demo mode'}));
+app.post('/api/cases',async(req,res)=>{const p=schema.safeParse(req.body);if(!p.success)return res.status(400).json({error:p.error.issues[0].message});try{const data=await generateCase(p.data);let doc,session;if(mongoose.connection.readyState===1){doc=await Case.create(data);session=await GameSession.create({caseId:doc._id,token:randomUUID()});}else{doc={...data,_id:randomUUID()};session={token:randomUUID()};memorySessions.set(session.token,{caseData:doc,notes:'',bookmarks:[],viewed:[],accusation:null});}res.status(201).json({case:publicCase(doc),token:session.token});}catch(e){console.error(e);res.status(502).json({error:e.message||'Mystery generation failed.'});}});
+app.get('/api/session',owned,(req,res)=>{const g=req.game,c=g.caseId||g.caseData;res.json({case:publicCase(c),progress:{notes:g.notes,bookmarks:g.bookmarks,viewed:g.viewed,resolved:!!g.accusation,result:g.accusation?{correct:g.accusation===c.solution.culpritId,accusation:g.accusation,solution:c.solution,suspects:c.suspects}:null}});});
+app.patch('/api/session',owned,async(req,res)=>{if(req.game.accusation)return res.status(409).json({error:'This investigation is already resolved.'});const p=z.object({notes:z.string().max(5000).optional(),bookmarks:z.array(z.string()).optional(),viewed:z.array(z.string()).optional()}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid progress update.'});Object.assign(req.game,p.data);if(typeof req.game.save==='function')await req.game.save();res.json({ok:true});});
+app.post('/api/session/accuse',owned,async(req,res)=>{if(req.game.accusation)return res.status(409).json({error:'A final accusation has already been submitted.'});const id=z.string().safeParse(req.body.suspectId);if(!id.success)return res.status(400).json({error:'Choose a suspect.'});const c=req.game.caseId||req.game.caseData;if(!c.suspects.some(s=>s.id===id.data))return res.status(400).json({error:'That suspect is not part of this case.'});req.game.accusation=id.data;req.game.resolvedAt=new Date();if(typeof req.game.save==='function')await req.game.save();res.json({correct:id.data===c.solution.culpritId,accusation:id.data,solution:c.solution,suspects:c.suspects});});
+const port=process.env.PORT||4000;if(process.env.MONGODB_URI)mongoose.connect(process.env.MONGODB_URI).then(()=>console.log('MongoDB connected')).catch(e=>console.error('MongoDB unavailable; demo sessions are in-memory only:',e.message));app.listen(port,'0.0.0.0',()=>console.log(`Mystery Room API listening on ${port}`));
